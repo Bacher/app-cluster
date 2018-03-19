@@ -1,0 +1,19 @@
+{
+  "name": "app-cluster",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "etcd3": "^0.2.9",
+    "express": "^4.16.3",
+    "lodash": "^4.17.5",
+    "memcached": "^2.2.2",
+    "rpc-easy": "^0.2.6"
+  }
+}
