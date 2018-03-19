@@ -1,6 +1,7 @@
 const crypto    = require('crypto');
 const Server    = require('rpc-easy/Server');
 const Memcached = require('memcached');
+const _         = require('lodash');
 
 const { Etcd3 } = require('etcd3');
 const memcached = new Memcached();
@@ -12,6 +13,9 @@ const rpcServer = new Server();
 const appServerId      = crypto.randomBytes(4).toString('hex');
 const etcdServerKey    = `apiServer/${appServerId}`;
 let etcdServerKeyLease = null;
+
+let terminating = false;
+let refreshUsersRoutesInterval = null;
 
 const gates = new Set();
 
@@ -86,14 +90,20 @@ rpcServer.listen({
         console.error(err);
         process.exit(1);
     }
+
+    refreshUsersRoutesInterval = setInterval(refreshUserRoutes, 60 * 1000);
 });
 
 let nextForceExit = false;
 
 process.on('SIGINT', async () => {
+    terminating = true;
+
     if (nextForceExit) {
         process.exit(1);
     }
+
+    clearInterval(refreshUsersRoutesInterval);
 
     nextForceExit = true;
 
@@ -101,23 +111,26 @@ process.on('SIGINT', async () => {
         code: 'TERMINATING',
     });
 
-    for (let [userId, user] of userCache) {
-        console.log(`saving user ${userId}...`);
-        await saveUserCache(user);
+    const chunks = _.chunk(Array.from(userCache.values()), 10);
+
+    for (let chunk of chunks) {
+        for (let user of chunk) {
+            await saveUserCache(user);
+        }
 
         gateBroadcast({
             code:     'USERS_FREE',
-            usersIds: [userId],
+            usersIds: chunk.map(user => user.userId),
         });
     }
 
-    await sleep(1000);
+    await sleep(500);
 
     if (etcdServerKeyLease) {
         try {
             await etcdServerKeyLease.revoke();
         } catch(err) {
-            console.error(err);
+            console.error('revoke error', err);
         }
     }
 
@@ -144,7 +157,7 @@ function loadUserCache(userId) {
                 if (json) {
                     resolve(JSON.parse(json));
                     deleteUserCache(userId).catch(err => {
-                        console.error(err);
+                        console.error('deleteUserCache', err);
                     });
                 } else {
                     resolve(null);
@@ -177,4 +190,14 @@ function deleteUserCache(userId) {
             }
         });
     });
+}
+
+function refreshUserRoutes() {
+    for (let userId of userCache.keys()) {
+        memcached.set(`route/${userId}`, appServerId, 90, err => {
+            if (err) {
+                console.error('memcache set error:', err);
+            }
+        });
+    }
 }

@@ -2,6 +2,7 @@ const express   = require('express');
 const RpcClient = require('rpc-easy/Client');
 const { Etcd3 } = require('etcd3');
 const _         = require('lodash');
+const Memcached = require('memcached');
 
 const API_SERVER_PREFIX = 'apiServer/';
 
@@ -13,15 +14,17 @@ const API_SERVER_STATUS = {
     DOWN:     3,
 };
 
+const port = process.env['PORT'] || '9080';
+
 const etcd = new Etcd3();
+const memcached = new Memcached();
 
 const TOKES_MAP = new Map([
     ['123', 2],
     ['124', 3],
 ]);
 
-const apiServers = new Map();
-const usersRoutes = new Map();
+const apiServers    = new Map();
 const requestsQueue = new Map();
 
 async function initEtcd() {
@@ -53,11 +56,12 @@ async function initEtcd() {
 
         const waits = [];
 
-        for (let [userId, apiServerId] of usersRoutes) {
-            if (apiServerId === id) {
-                waits.push(rerouteUser(userId).catch(err => {
-                    console.error(err);
-                }));
+        for (let [userId, requests] of requestsQueue) {
+            for (let req of requests) {
+                if (req.waitApiServerId === apiServer.id) {
+                    waits.push(rerouteUser(userId));
+                    break;
+                }
             }
         }
 
@@ -95,7 +99,7 @@ function addNewApiServer(id, address) {
                 apiServers.status = API_SERVER_STATUS.DRAINING;
                 break;
             case 'USERS_FREE':
-                onUsersFreeMessage(id, data.usersIds).catch(err => {
+                onUsersFreeMessage(data.usersIds).catch(err => {
                     console.error(err);
                 });
                 break;
@@ -120,13 +124,9 @@ initEtcd().catch(err => {
     process.exit(1);
 });
 
-async function onUsersFreeMessage(apiServerId, usersIds) {
+async function onUsersFreeMessage(usersIds) {
     for (let userId of usersIds) {
-        const apiServer = usersRoutes.get(userId);
-
-        if (apiServer.id === apiServerId) {
-            await rerouteUser(userId);
-        }
+        await rerouteUser(userId);
     }
 }
 
@@ -143,32 +143,7 @@ app.get('/api/sayHello.json', async (req, res) => {
         return;
     }
 
-    let apiServer = null;
-    let serverId  = usersRoutes.get(userId);
-
-    if (serverId) {
-        apiServer = apiServers.get(serverId);
-
-        if (apiServer.status !== API_SERVER_STATUS.OK) {
-            let queue = requestsQueue.get(userId);
-
-            if (!queue) {
-                queue = [];
-                requestsQueue.set(userId, queue);
-            }
-
-            queue.push({ userId, res });
-            // TODO: НАЧАТЬ (ИЛИ ПРИСОЕДИНИТЬСЯ К ОЖИДАНИЮ) ПЕРЕБРОС СТЕЙТА И РЕРОУТИНГ
-            console.log('NEED_REROUTING');
-            apiServer = null;
-        }
-    } else {
-        apiServer = findLiveAppServer();
-
-        if (apiServer) {
-            usersRoutes.set(userId, apiServer.id);
-        }
-    }
+    const apiServer = await routeUser(userId);
 
     if (!apiServer) {
         res.status(500);
@@ -178,18 +153,30 @@ app.get('/api/sayHello.json', async (req, res) => {
         return;
     }
 
-    await makeRequest(apiServer, userId, res);
+    if (apiServer.status === API_SERVER_STATUS.OK) {
+        await makeRequest(apiServer, userId, res);
+
+    } else {
+        let queue = requestsQueue.get(userId);
+
+        if (!queue) {
+            queue = [];
+            requestsQueue.set(userId, queue);
+        }
+
+        queue.push({ userId, res, waitApiServerId: apiServer.id });
+    }
 });
 
 function findLiveAppServer() {
     return _.sample(Array.from(apiServers.values()).filter(a => a.status === API_SERVER_STATUS.OK));
 }
 
-app.listen(9080, err => {
+app.listen(port, err => {
     if (err) {
         throw err;
     }
-    console.log('Server listen at 0.0.0.0:9080, try http://localhost:9080/api/sayHello.json');
+    console.log(`Server listen at 0.0.0.0:${port}, try http://localhost:${port}/api/sayHello.json`);
 });
 
 async function makeRequest(apiServer, userId, res) {
@@ -217,11 +204,10 @@ async function makeRequest(apiServer, userId, res) {
 }
 
 async function rerouteUser(userId) {
-    usersRoutes.delete(userId);
-
     if (requestsQueue.has(userId)) {
-        const requests  = requestsQueue.has(userId);
-        const apiServer = findLiveAppServer();
+        const apiServer = await routeUser(userId);
+        const requests  = requestsQueue.get(userId);
+        requestsQueue.delete(userId);
 
         if (!apiServer) {
             for (let { res } of requests) {
@@ -233,10 +219,67 @@ async function rerouteUser(userId) {
             return;
         }
 
-        usersRoutes.set(userId, apiServer.id);
-
         for (let { userId, res } of requests) {
             await makeRequest(apiServer, userId, res);
         }
     }
+}
+
+async function routeUser(userId, remain = 3) {
+    return new Promise((resolve, reject) => {
+        const key = `route/${userId}`;
+
+        memcached.get(key, (err, apiServerId) => {
+            console.log('memcached.get() =>', apiServerId);
+
+            if (err) {
+                reject(err);
+                return;
+            }
+
+            if (apiServerId) {
+                const apiServer = apiServers.get(apiServerId);
+
+                if (apiServer) {
+                    if (apiServer.status === API_SERVER_STATUS.OK || apiServer.status === API_SERVER_STATUS.DRAINING) {
+                        resolve(apiServer);
+                        return;
+                    }
+                }
+            }
+
+            const apiServer = findLiveAppServer();
+
+            if (!apiServer) {
+                resolve(null);
+                return;
+            }
+
+            memcached.set(key, apiServer.id, 2 * 60, err => {
+                if (err) {
+                    recover(err);
+                    return;
+                }
+
+                setTimeout(() => {
+                    resolve(routeUser(userId, remain - 1));
+                }, 100);
+            });
+        });
+
+        function recover(err) {
+            if (err) {
+                console.error(err);
+            }
+
+            if (remain === 0) {
+                reject(new Error('CYCLED'));
+                return;
+            }
+
+            setTimeout(() => {
+                resolve(routeUser(userId, remain - 1));
+            }, 100);
+        }
+    });
 }
