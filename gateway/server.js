@@ -225,7 +225,24 @@ async function rerouteUser(userId) {
     }
 }
 
-async function routeUser(userId, remain = 3) {
+const routeUsersCalls = new Map();
+
+function routeUser(userId) {
+    let promise = routeUsersCalls.get(userId);
+
+    if (!promise) {
+        promise = _routeUser(userId);
+        routeUsersCalls.set(userId, promise);
+    }
+
+    promise.catch().then(() => {
+        routeUsersCalls.delete(userId);
+    });
+
+    return promise;
+}
+
+async function _routeUser(userId, remain = 3) {
     return new Promise((resolve, reject) => {
         const key = `route/${userId}`;
 
