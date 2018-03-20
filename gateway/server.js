@@ -27,6 +27,10 @@ const TOKES_MAP = new Map([
 const apiServers    = new Map();
 const requestsQueue = new Map();
 
+const waitApiServerResponses = new Set();
+
+let terminating = false;
+
 async function initEtcd() {
     const watcher = await etcd.watch().prefix(API_SERVER_PREFIX).create();
 
@@ -133,6 +137,14 @@ async function onUsersFreeMessage(usersIds) {
 const app = express();
 
 app.get('/api/sayHello.json', async (req, res) => {
+    if (terminating) {
+        res.status(500);
+        res.json({
+            errorCode: 'REDIRECT',
+        });
+        return;
+    }
+
     const userId = TOKES_MAP.get(req.query.token);
 
     if (!userId) {
@@ -180,10 +192,21 @@ app.listen(port, err => {
 });
 
 async function makeRequest(apiServer, userId, res) {
+    const requestInfo = {
+        res,
+        promise: null,
+    };
+
+    waitApiServerResponses.add(requestInfo);
+
     try {
-        const data = await apiServer.rpc.request('sayHello', {
+        requestInfo.promise = apiServer.rpc.request('sayHello', {
             userId,
         });
+
+        const data = await requestInfo.promise;
+
+        waitApiServerResponses.delete(requestInfo);
 
         res.json({
             status:   'OK',
@@ -191,6 +214,8 @@ async function makeRequest(apiServer, userId, res) {
         });
     } catch(err) {
         console.error('rpc request error:', err);
+
+        waitApiServerResponses.delete(requestInfo);
 
         try {
             res.status(500);
@@ -279,7 +304,7 @@ async function _routeUser(userId, remain = 3) {
                 }
 
                 setTimeout(() => {
-                    resolve(routeUser(userId, remain - 1));
+                    resolve(_routeUser(userId, remain - 1));
                 }, 100);
             });
         });
@@ -295,8 +320,59 @@ async function _routeUser(userId, remain = 3) {
             }
 
             setTimeout(() => {
-                resolve(routeUser(userId, remain - 1));
+                resolve(_routeUser(userId, remain - 1));
             }, 100);
         }
+    });
+}
+
+let nextForceExit = false;
+
+process.on('SIGINT', async () => {
+    terminating = true;
+
+    if (nextForceExit) {
+        process.exit(1);
+    }
+
+    nextForceExit = true;
+
+    for (let [, queue] of requestsQueue) {
+        for (let item of queue) {
+            item.res.status(500);
+            item.res.json({
+                errorCode: 'REDIRECT',
+            });
+        }
+    }
+
+    requestsQueue.clear();
+
+    const waits = Array.from(waitApiServerResponses.keys()).map(data => {
+        return data.promise.catch().then(() => {
+            waitApiServerResponses.delete(data);
+        });
+    });
+    waits.push(timeout(5000));
+
+    try {
+        await Promise.all(waits);
+    } catch(err) {
+        for (let data of waitApiServerResponses) {
+            data.res.status(500);
+            data.res({
+                errorCode: 'TIMEOUT',
+            });
+        }
+        console.error(err);
+        process.exit(1);
+    }
+
+    process.exit(0);
+});
+
+function timeout(ms) {
+    return new Promise((resolve, reject) => {
+        setTimeout(() => reject(new Error('TIMEOUT')), ms);
     });
 }
