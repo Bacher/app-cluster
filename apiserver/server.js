@@ -1,12 +1,15 @@
 const crypto    = require('crypto');
-const Server    = require('rpc-easy/Server');
-const Memcached = require('memcached');
 const _         = require('lodash');
-
+const Server    = require('rpc-easy/Server');
 const { Etcd3 } = require('etcd3');
-const memcached = new Memcached();
+const redis     = require('redis');
+const bluebird  = require('bluebird');
+
+bluebird.promisifyAll(redis.RedisClient.prototype);
+bluebird.promisifyAll(redis.Multi.prototype);
 
 const etcd = new Etcd3();
+const rd = redis.createClient();
 
 const rpcServer = new Server();
 
@@ -45,7 +48,7 @@ rpcServer.on('connection', conn => {
                     try {
                         user = await loadUserCache(data.userId);
                     } catch(err) {
-                        console.error('load user cache from memcached failed:', err);
+                        console.error('load user cache failed:', err);
                     }
 
                     if (!user) {
@@ -184,56 +187,35 @@ function gateBroadcast(data) {
     }
 }
 
-function loadUserCache(userId) {
-    return new Promise((resolve, reject) => {
-        memcached.get(`user/${userId}`, (err, json) => {
-            if (err) {
-                reject(err);
-            } else {
-                console.log('memcached loaded', `user/${userId}`, json);
-                if (json) {
-                    resolve(JSON.parse(json));
-                    deleteUserCache(userId).catch(err => {
-                        console.error('deleteUserCache', err);
-                    });
-                } else {
-                    resolve(null);
-                }
-            }
+async function loadUserCache(userId) {
+    const json = await rd.getAsync(`user/${userId}`);
+    console.log('user cache loaded', `user/${userId}`, json);
+
+    if (json) {
+        deleteUserCache(userId).catch(err => {
+            console.error('deleteUserCache', err);
         });
-    });
+
+        return JSON.parse(json);
+    } else {
+        return null;
+    }
 }
 
-function saveUserCache(user) {
-    return new Promise((resolve, reject) => {
-        console.log('set:', `user/${user.userId}`, JSON.stringify(user));
-        memcached.set(`user/${user.userId}`, JSON.stringify(user), 120, err => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve();
-            }
-        });
-    });
+async function saveUserCache(user) {
+    console.log('set:', `user/${user.userId}`, JSON.stringify(user));
+    await rd.setAsync(`user/${user.userId}`, JSON.stringify(user), 'EX', 120);
 }
 
-function deleteUserCache(userId) {
-    return new Promise((resolve, reject) => {
-        memcached.del(`user/${userId}`, err => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve();
-            }
-        });
-    });
+async function deleteUserCache(userId) {
+    await rd.delAsync(`user/${userId}`);
 }
 
 function refreshUserRoutes() {
     for (let userId of userCache.keys()) {
-        memcached.set(`route/${userId}`, appServerId, 90, err => {
+        rd.set(`route/${userId}`, appServerId, 'EX', 90, err => {
             if (err) {
-                console.error('memcache set error:', err);
+                console.error('cache set error:', err);
             }
         });
     }

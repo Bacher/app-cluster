@@ -1,8 +1,13 @@
 const express   = require('express');
 const RpcClient = require('rpc-easy/Client');
-const { Etcd3 } = require('etcd3');
 const _         = require('lodash');
-const Memcached = require('memcached');
+const { Etcd3 } = require('etcd3');
+const redis     = require('redis');
+const bluebird  = require('bluebird');
+
+bluebird.promisifyAll(redis.RedisClient.prototype);
+bluebird.promisifyAll(redis.Multi.prototype);
+
 const UserRequestsStore = require('./UserRequestsStore');
 const UserRequest = require('./UserRequest');
 
@@ -19,7 +24,8 @@ const API_SERVER_STATUS = {
 const port = process.env['PORT'] || '9080';
 
 const etcd = new Etcd3();
-const memcached = new Memcached();
+
+const rd = redis.createClient();
 
 const TOKES_MAP = new Map([
     ['123', 2],
@@ -89,6 +95,8 @@ async function initEtcd() {
             addNewApiServer(id, apiServersInfo[key]);
         }
     }
+
+    initWebServer();
 }
 
 function addNewApiServer(id, address) {
@@ -141,61 +149,63 @@ async function onUsersFreeMessage(usersIds) {
     }
 }
 
-const app = express();
+function initWebServer() {
+    const app = express();
 
-app.get('/api/sayHello.json', async (req, res) => {
-    if (terminating) {
-        res.status(500);
-        res.json({
-            errorCode: 'REDIRECT',
-        });
-        return;
-    }
-
-    const userId = TOKES_MAP.get(req.query.token);
-
-    if (!userId) {
-        res.status(400);
-        res.json({
-            errorCode: 'UNAUTHORIZED',
-        });
-        return;
-    }
-
-    const request = new UserRequest(requestsStore, userId, res);
-
-    const apiServer = await routeUser(userId);
-
-    if (!apiServer) {
-        request.error(500, 'NO_API_SERVERS');
-        return;
-    }
-
-    if (apiServer.status === API_SERVER_STATUS.OK) {
-        await makeRequest(apiServer, userId, request);
-
-    } else {
-        let queue = requestsQueue.get(userId);
-
-        if (!queue) {
-            queue = [];
-            requestsQueue.set(userId, queue);
+    app.get('/api/sayHello.json', async (req, res) => {
+        if (terminating) {
+            res.status(500);
+            res.json({
+                errorCode: 'REDIRECT',
+            });
+            return;
         }
 
-        queue.push({ userId, request, waitApiServerId: apiServer.id });
-    }
-});
+        const userId = TOKES_MAP.get(req.query.token);
+
+        if (!userId) {
+            res.status(400);
+            res.json({
+                errorCode: 'UNAUTHORIZED',
+            });
+            return;
+        }
+
+        const request = new UserRequest(requestsStore, userId, res);
+
+        const apiServer = await routeUser(userId);
+
+        if (!apiServer) {
+            request.error(500, 'NO_API_SERVERS');
+            return;
+        }
+
+        if (apiServer.status === API_SERVER_STATUS.OK) {
+            await makeRequest(apiServer, userId, request);
+
+        } else {
+            let queue = requestsQueue.get(userId);
+
+            if (!queue) {
+                queue = [];
+                requestsQueue.set(userId, queue);
+            }
+
+            queue.push({ userId, request, waitApiServerId: apiServer.id });
+        }
+    });
+
+    app.listen(port, err => {
+        if (err) {
+            throw err;
+        }
+        console.log(`Server listen at 0.0.0.0:${port}, try http://localhost:${port}/api/sayHello.json`);
+    });
+}
 
 function findLiveAppServer() {
     return _.sample(Array.from(apiServers.values()).filter(a => a.status === API_SERVER_STATUS.OK));
 }
-
-app.listen(port, err => {
-    if (err) {
-        throw err;
-    }
-    console.log(`Server listen at 0.0.0.0:${port}, try http://localhost:${port}/api/sayHello.json`);
-});
 
 async function makeRequest(apiServer, userId, request) {
     const requestInfo = {
@@ -253,7 +263,7 @@ function routeUser(userId) {
     let promise = routeUsersCalls.get(userId);
 
     if (!promise) {
-        promise = _routeUser(userId);
+        promise = _routeUserSynced(userId);
         routeUsersCalls.set(userId, promise);
     }
 
@@ -264,63 +274,54 @@ function routeUser(userId) {
     return promise;
 }
 
+let last = Promise.resolve();
+
+async function _routeUserSynced(userId) {
+    await last;
+    const promise = _routeUser(userId);
+    last = promise.catch(_.noop);
+    return promise;
+}
+
 async function _routeUser(userId, remain = 3) {
-    return new Promise((resolve, reject) => {
-        const key = `route/${userId}`;
+    if (remain === 0) {
+        throw new Error('CYCLED_LOCK');
+    }
 
-        memcached.get(key, (err, apiServerId) => {
-            console.log('memcached.get() =>', apiServerId);
+    const key = `route/${userId}`;
 
-            if (err) {
-                reject(err);
-                return;
-            }
+    const apiServerId = await rd.getAsync(key);
+    console.log('get() =>', apiServerId);
 
-            if (apiServerId) {
-                const apiServer = apiServers.get(apiServerId);
+    if (apiServerId) {
+        const apiServer = apiServers.get(apiServerId);
 
-                if (apiServer) {
-                    if (apiServer.status === API_SERVER_STATUS.OK || apiServer.status === API_SERVER_STATUS.DRAINING) {
-                        resolve(apiServer);
-                        return;
-                    }
-                }
-            }
-
-            const apiServer = findLiveAppServer();
-
-            if (!apiServer) {
-                resolve(null);
-                return;
-            }
-
-            memcached.set(key, apiServer.id, 2 * 60, err => {
-                if (err) {
-                    recover(err);
-                    return;
-                }
-
-                setTimeout(() => {
-                    resolve(_routeUser(userId, remain - 1));
-                }, 100);
-            });
-        });
-
-        function recover(err) {
-            if (err) {
-                console.error(err);
-            }
-
-            if (remain === 0) {
-                reject(new Error('CYCLED'));
-                return;
-            }
-
-            setTimeout(() => {
-                resolve(_routeUser(userId, remain - 1));
-            }, 100);
+        if (apiServer && apiServer.status === API_SERVER_STATUS.OK || apiServer.status === API_SERVER_STATUS.DRAINING) {
+            return apiServer;
         }
-    });
+    }
+
+    const apiServer = findLiveAppServer();
+
+    if (!apiServer) {
+        return null;
+    }
+
+    await rd.watchAsync(key);
+    const apiServerId2 = await rd.getAsync(key);
+
+    if (apiServerId2 && apiServerId !== apiServerId2) {
+        rd.unwatchAsync(key);
+        return await _routeUser(userId, remain - 1);
+    }
+
+    const result = await rd.multi().set(key, apiServer.id, 'EX', 2 * 60).execAsync();
+
+    if (result) {
+        return apiServer;
+    } else {
+        return await _routeUser(userId, remain - 1);
+    }
 }
 
 let nextForceExit = false;
