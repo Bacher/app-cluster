@@ -21,36 +21,58 @@ const gates = new Set();
 
 const userCache = new Map();
 
+const requestsInProgress = new Set();
+
 rpcServer.on('connection', conn => {
-    conn.setRequestHandler(async (apiName, data) => {
-        console.log('Api call:', apiName, data);
-
-        let user = userCache.get(data.userId);
-        if (!user) {
-            try {
-                user = await loadUserCache(data.userId);
-            } catch(err) {
-                console.error('load user cache from memcached failed:', err);
-            }
-
-            if (!user) {
-                user = {
-                    userId: data.userId,
-                    inc:    0,
-                };
-            }
-
-            userCache.set(data.userId, user);
-        }
-
-        user.inc++;
-
-        return {
-            status:      'OK',
-            inc:         user.inc,
-            from:        'api server',
-            apiServerId: appServerId,
+    conn.setRequestHandler((apiName, data) => {
+        const apiCall = {
+            promise: null,
+            resolve: null,
+            reject:  null,
+            aborted: false,
+            done:    false,
         };
+
+        apiCall.promise = new Promise(async (resolve, reject) => {
+            apiCall.resolve = resolve;
+            apiCall.reject  = reject;
+
+            try {
+                console.log('Api call:', apiName, data);
+
+                let user = userCache.get(data.userId);
+                if (!user) {
+                    try {
+                        user = await loadUserCache(data.userId);
+                    } catch(err) {
+                        console.error('load user cache from memcached failed:', err);
+                    }
+
+                    if (!user) {
+                        user = await loadUser(data.userId);
+                    }
+
+                    userCache.set(data.userId, user);
+                }
+
+                const result = await doApi(user);
+                apiCall.done = true;
+                resolve(result);
+
+            } catch(err) {
+                apiCall.done = true;
+                // TODO reject ? or resolve with error object?
+                reject(err);
+            }
+        });
+
+        requestsInProgress.add(apiCall);
+
+        apiCall.promise.catch(_.noop).then(() => {
+            requestsInProgress.delete(apiCall);
+        });
+
+        return apiCall.promise;
     });
 
     conn.on('error', err => {
@@ -103,6 +125,8 @@ process.on('SIGINT', async () => {
         process.exit(1);
     }
 
+    console.log('Terminating');
+
     clearInterval(refreshUsersRoutesInterval);
 
     nextForceExit = true;
@@ -110,6 +134,14 @@ process.on('SIGINT', async () => {
     gateBroadcast({
         code: 'TERMINATING',
     });
+
+    await sleep(1000);
+
+    try {
+        await withTimeout(5000, waitAllInProgress());
+    } catch(err) {
+        console.error(err);
+    }
 
     const chunks = _.chunk(Array.from(userCache.values()), 10);
 
@@ -128,21 +160,22 @@ process.on('SIGINT', async () => {
         });
     }
 
-    await sleep(500);
-
     if (etcdServerKeyLease) {
         try {
+            await sleep(500);
             await etcdServerKeyLease.revoke();
         } catch(err) {
             console.error('revoke error', err);
         }
     }
 
-    process.exit(0);
+    await shutdown();
 });
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+async function waitAllInProgress() {
+    while (requestsInProgress.size) {
+        await Promise.all(Array.from(requestsInProgress.keys()).map(request => request.promise));
+    }
 }
 
 function gateBroadcast(data) {
@@ -204,4 +237,46 @@ function refreshUserRoutes() {
             }
         });
     }
+}
+
+async function loadUser(userId) {
+    // STUB
+    await sleep(500);
+
+    return {
+        userId: userId,
+        inc:    0,
+    };
+}
+
+async function doApi(user) {
+    user.inc++;
+
+    await sleep(3000);
+
+    return {
+        status:      'OK',
+        inc:         user.inc,
+        from:        'api server',
+        apiServerId: appServerId,
+    };
+}
+
+async function shutdown(exitCode = 0) {
+    await sleep(500);
+    process.exit()
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function timeout(ms) {
+    return new Promise((resolve, reject) => {
+        setTimeout(() => reject(new Error('TIMEOUT')), ms);
+    });
+}
+
+function withTimeout(ms, result) {
+    return Promise.race([timeout(ms), result]);
 }

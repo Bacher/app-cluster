@@ -3,6 +3,8 @@ const RpcClient = require('rpc-easy/Client');
 const { Etcd3 } = require('etcd3');
 const _         = require('lodash');
 const Memcached = require('memcached');
+const UserRequestsStore = require('./UserRequestsStore');
+const UserRequest = require('./UserRequest');
 
 const API_SERVER_PREFIX = 'apiServer/';
 
@@ -26,6 +28,7 @@ const TOKES_MAP = new Map([
 
 const apiServers    = new Map();
 const requestsQueue = new Map();
+const requestsStore = new UserRequestsStore();
 
 const waitApiServerResponses = new Set();
 
@@ -38,25 +41,29 @@ async function initEtcd() {
 
     watcher.on('connected', () => console.log('successfully reconnected!'));
     watcher.on('disconnected', () => console.log('disconnected...'));
-    watcher.on('put', res => {
-        if (!inited) {
+    watcher.on('put', data => {
+        if (!inited || terminating) {
             return;
         }
 
-        const id = res.key.toString().match(/^apiServer\/(.*)$/)[1];
+        const id = data.key.toString().match(/^apiServer\/(.*)$/)[1];
 
-        addNewApiServer(id, res.value.toString());
+        addNewApiServer(id, data.value.toString());
     });
-    watcher.on('delete', async res => {
+    watcher.on('delete', async data => {
         if (!inited) {
             return;
         }
 
-        const id = res.key.toString().match(/^apiServer\/(.*)$/)[1];
+        const id = data.key.toString().match(/^apiServer\/(.*)$/)[1];
 
         const apiServer = apiServers.get(id);
 
         apiServer.status = API_SERVER_STATUS.DOWN;
+
+        if (terminating) {
+            return;
+        }
 
         const waits = [];
 
@@ -155,18 +162,17 @@ app.get('/api/sayHello.json', async (req, res) => {
         return;
     }
 
+    const request = new UserRequest(requestsStore, userId, res);
+
     const apiServer = await routeUser(userId);
 
     if (!apiServer) {
-        res.status(500);
-        res.json({
-            errorCode: 'NO_API_SERVERS',
-        });
+        request.error(500, 'NO_API_SERVERS');
         return;
     }
 
     if (apiServer.status === API_SERVER_STATUS.OK) {
-        await makeRequest(apiServer, userId, res);
+        await makeRequest(apiServer, userId, request);
 
     } else {
         let queue = requestsQueue.get(userId);
@@ -176,7 +182,7 @@ app.get('/api/sayHello.json', async (req, res) => {
             requestsQueue.set(userId, queue);
         }
 
-        queue.push({ userId, res, waitApiServerId: apiServer.id });
+        queue.push({ userId, request, waitApiServerId: apiServer.id });
     }
 });
 
@@ -191,9 +197,9 @@ app.listen(port, err => {
     console.log(`Server listen at 0.0.0.0:${port}, try http://localhost:${port}/api/sayHello.json`);
 });
 
-async function makeRequest(apiServer, userId, res) {
+async function makeRequest(apiServer, userId, request) {
     const requestInfo = {
-        res,
+        request,
         promise: null,
     };
 
@@ -208,23 +214,17 @@ async function makeRequest(apiServer, userId, res) {
 
         waitApiServerResponses.delete(requestInfo);
 
-        res.json({
+        request.end({
             status:   'OK',
             response: data,
         });
+
     } catch(err) {
         console.error('rpc request error:', err);
 
         waitApiServerResponses.delete(requestInfo);
 
-        try {
-            res.status(500);
-            res.json({
-                errorCode: 'ERROR',
-            });
-        } catch(err) {
-            res.destroy();
-        }
+        request.error(500, 'ERROR');
     }
 }
 
@@ -235,17 +235,14 @@ async function rerouteUser(userId) {
         requestsQueue.delete(userId);
 
         if (!apiServer) {
-            for (let { res } of requests) {
-                res.status(500);
-                res.json({
-                    errorCode: 'NO_API_SERVERS',
-                });
+            for (let { request } of requests) {
+                request.error(500, 'NO_API_SERVERS');
             }
             return;
         }
 
-        for (let { userId, res } of requests) {
-            await makeRequest(apiServer, userId, res);
+        for (let { userId, request } of requests) {
+            await makeRequest(apiServer, userId, request);
         }
     }
 }
@@ -260,7 +257,7 @@ function routeUser(userId) {
         routeUsersCalls.set(userId, promise);
     }
 
-    promise.catch().then(() => {
+    promise.catch(_.noop).then(() => {
         routeUsersCalls.delete(userId);
     });
 
@@ -338,38 +335,50 @@ process.on('SIGINT', async () => {
     nextForceExit = true;
 
     for (let [, queue] of requestsQueue) {
-        for (let item of queue) {
-            item.res.status(500);
-            item.res.json({
-                errorCode: 'REDIRECT',
-            });
+        for (let { request } of queue) {
+            request.error(500, 'REDIRECT');
         }
     }
 
     requestsQueue.clear();
 
     const waits = Array.from(waitApiServerResponses.keys()).map(data => {
-        return data.promise.catch().then(() => {
+        return data.promise.catch(_.noop).then(() => {
             waitApiServerResponses.delete(data);
         });
     });
-    waits.push(timeout(5000));
 
-    try {
-        await Promise.all(waits);
-    } catch(err) {
-        for (let data of waitApiServerResponses) {
-            data.res.status(500);
-            data.res({
-                errorCode: 'TIMEOUT',
-            });
+    if (waits.length) {
+        try {
+            await Promise.race([Promise.all(waits), timeout(5000)]);
+
+        } catch(err) {
+            console.error(err);
+
+            for (let data of waitApiServerResponses) {
+                data.request.error(500, 'TIMEOUT');
+            }
+
+            await shutdown(1);
         }
-        console.error(err);
-        process.exit(1);
     }
 
-    process.exit(0);
+    await shutdown();
 });
+
+async function shutdown(exitCode = 0) {
+    for (let request of requestsStore.getInProgress()) {
+        request.error(500, 'REDIRECT');
+    }
+
+    await sleep(500);
+
+    process.exit(exitCode);
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function timeout(ms) {
     return new Promise((resolve, reject) => {
