@@ -114,9 +114,13 @@ process.on('SIGINT', async () => {
     const chunks = _.chunk(Array.from(userCache.values()), 10);
 
     for (let chunk of chunks) {
+        const wait = [];
+
         for (let user of chunk) {
-            await saveUserCache(user);
+            wait.push(saveUserCache(user));
         }
+
+        await Promise.all(wait);
 
         gateBroadcast({
             code:     'USERS_FREE',
