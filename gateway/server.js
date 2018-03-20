@@ -21,11 +21,15 @@ const API_SERVER_STATUS = {
     DOWN:     3,
 };
 
-const port = process.env['PORT'] || '9080';
+const port = process.env['PORT'] || '80';
 
-const etcd = new Etcd3();
+const etcd = new Etcd3({
+    hosts: process.env['ETCD_ADDR'] || 'localhost:2379',
+});
 
-const rd = redis.createClient();
+const rd = redis.createClient({
+    host: process.env['REDIS_ADDR'] || 'localhost',
+});
 
 const TOKES_MAP = new Map([
     ['123', 2],
@@ -125,6 +129,10 @@ function addNewApiServer(id, address) {
             default:
                 console.error('Invalid message from api server:', data);
         }
+    });
+
+    rpcClient.on('error', err => {
+        console.error('RPC Client error:', err);
     });
 
     rpcClient.connect();

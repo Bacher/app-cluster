@@ -1,4 +1,5 @@
 const crypto    = require('crypto');
+const os        = require('os');
 const _         = require('lodash');
 const Server    = require('rpc-easy/Server');
 const { Etcd3 } = require('etcd3');
@@ -8,8 +9,12 @@ const bluebird  = require('bluebird');
 bluebird.promisifyAll(redis.RedisClient.prototype);
 bluebird.promisifyAll(redis.Multi.prototype);
 
-const etcd = new Etcd3();
-const rd = redis.createClient();
+const etcd = new Etcd3({
+    hosts: process.env['ETCD_ADDR'] || 'localhost:2379',
+});
+const rd = redis.createClient({
+    host: process.env['REDIS_ADDR'] || 'localhost',
+});
 
 const rpcServer = new Server();
 
@@ -25,6 +30,23 @@ const gates = new Set();
 const userCache = new Map();
 
 const requestsInProgress = new Set();
+
+const interfaces = os.networkInterfaces();
+let iface = null;
+
+for (let interfaceName in interfaces) {
+    for (let face of interfaces[interfaceName]) {
+        if (!face.internal && face.family === 'IPv4') {
+            iface = face;
+            break;
+        }
+    }
+}
+
+if (!iface) {
+    console.error('Interface not found');
+    process.exit(10);
+}
 
 rpcServer.on('connection', conn => {
     conn.setRequestHandler((apiName, data) => {
@@ -96,8 +118,8 @@ rpcServer.on('error', err => {
 });
 
 rpcServer.listen({
-    host: '127.0.0.1',
-    port: 0,
+    host:      iface.address,
+    port:      Number(process.env['PORT']) || 12000,
     exclusive: true,
 }, async err => {
     if (err) {
@@ -106,11 +128,14 @@ rpcServer.listen({
         console.log(`Api Server [${appServerId}] started`);
     }
 
-    const address = rpcServer.address();
+    const addrInfo = rpcServer.address();
+    const address  = `${addrInfo.address}:${addrInfo.port}`;
+
+    console.log('Server address:', address);
 
     try {
         etcdServerKeyLease = etcd.lease();
-        await etcdServerKeyLease.put(etcdServerKey).value(`${address.address}:${address.port}`);
+        await etcdServerKeyLease.put(etcdServerKey).value(address);
     } catch(err) {
         console.error(err);
         process.exit(1);

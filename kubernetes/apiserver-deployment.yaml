@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apiserver
+  labels:
+    app: apiserver
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: apiserver
+  template:
+    metadata:
+      labels:
+        app: apiserver
+    spec:
+      containers:
+      - name: apiserver
+        image: apiserver
+        imagePullPolicy: Never
+        env:
+          - name: PORT
+            value: "12000"
+          - name: ETCD_ADDR
+            value: "etcd:2379"
+          - name: REDIS_ADDR
+            value: "redis"
+        ports:
+        - containerPort: 12000
